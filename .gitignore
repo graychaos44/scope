@@ -1,0 +1,10 @@
+runs/
+reports/
+SCOPE_LEDGER.tsv
+scope_metrics.json
+scope_calibration.json
+scope_worklist.tsv
+gcorp_*_env.py
+__pycache__/
+*.pyc
+venv*/
