@@ -217,6 +217,180 @@ def cmd_report(run_ids, fmt="md"):
     print(f"[보고] {p}")
 
 
+def cmd_bench_speed(args):
+    """[11] 벤치마크 — 어디가 얼마나 빠른지 한 자로 (08-14 신설).
+
+    사용: scope.py 벤치 [게임 …]
+    ★병목을 고치기 전에 **어디가 병목인지부터** 잰다.
+      08-13 에 게임을 2.5배 빠르게 고쳤는데 전체는 안 변했다 — 진짜 병목은 신경망(96%)이었다.
+    """
+    from scopelib import benchmark as BM
+    games = [a for a in args if not a.startswith("--")] or ["resource_defense_env"]
+    m = BM.machine()
+    print(f"[벤치마크] {m['기기']} · CPU {m['cpu']} · GPU {m['cuda']}\n")
+    rows = []
+    for g in games:
+        try:
+            rows.append(BM.bench_env(g))
+        except Exception as ex:
+            print(f"  ★{g} 실패: {type(ex).__name__}: {ex}")
+    try:
+        rows.append(BM.bench_net(device="cpu"))
+        import torch
+        if torch.cuda.is_available():
+            rows.append(BM.bench_net(device="cuda"))
+            rows.append(BM.bench_net(device="cuda", image=(12, 120, 160), batch=12, iters=200))
+    except Exception as ex:
+        print(f"  ★신경망 재기 실패: {type(ex).__name__}: {ex}")
+    rows += BM.bench_record()
+
+    print(f"{'항목':30s} {'초당 수':>12s} {'한 수':>10s}")
+    print("-" * 56)
+    for r in rows:
+        print(f"{r['항목']:30s} {r['초당수']:12,.0f} {r['한수us']:9.2f}us")
+    print()
+    print(BM.verdict(rows))
+    with Run("벤치마크", source="measured",
+             params={"env": ",".join(games), "episodes": 0,
+                     "decision_rule": "speed_bench", "기기": m["기기"]}) as run:
+        for r in rows:
+            key = r["항목"].replace(":", ".").replace("/", "_")
+            run.metric(f"speed.{key}", r["초당수"], unit="steps_per_sec")
+        run.table("벤치", rows)
+        run.tag("판정", BM.verdict(rows))
+
+
+def cmd_register(game, ckpt=None):
+    """[S1] 등록 한 번으로 **검사 → 기준선 → (있으면)능력 → 격차** 를 다 돌린다 (08-14 신설).
+
+    설계 완료조건 S1: *"게임 하나를 등록하면 **사람 손 없이** 검사→기준선→능력→격차가 다 나온다."*
+    지금까지는 명령을 하나씩 쳐야 했다 — 그래서 **빠뜨리는 일이 생겼다**
+    (08-13: 기준선을 안 재고 '전이 성립' 이라 판정했다가 뒤집힘, V702).
+
+    ★앞 단계가 실패하면 뒤를 **안 돌린다**(관문 규율 — 규약 §9-2).
+    """
+    from scopelib import bench as BN
+    print(f"[등록] {game} — 검사부터 차례로 돌린다. 앞이 막히면 뒤는 안 돌린다\n")
+    steps = []
+
+    print("① 검사 — 과제로 성립하는가")
+    rc = cmd_check(game)
+    steps.append(("검사", rc == 0))
+    if rc != 0:
+        print("\n★검사에서 막혔다 — 기준선을 안 돌린다. 게임을 먼저 고쳐라")
+        _register_summary(game, steps)
+        return 1
+
+    print("\n② 기준선 — 그냥 쉬운 게임은 아닌가")
+    try:
+        cmd_baseline(game)
+        steps.append(("기준선", True))
+    except Exception as ex:
+        print(f"★기준선 실패: {type(ex).__name__}: {ex}")
+        steps.append(("기준선", False))
+        _register_summary(game, steps)
+        return 1
+
+    if ckpt and os.path.exists(ckpt):
+        print("\n③ 능력 — 무엇을 보고 푸는가")
+        try:
+            cmd_probe(game, ckpt)
+            steps.append(("능력", True))
+        except Exception as ex:
+            print(f"★능력 실패: {type(ex).__name__}: {ex}")
+            steps.append(("능력", False))
+    else:
+        print("\n③ 능력 — 건너뜀(체크포인트를 안 줬다. `등록 <게임> <체크포인트>` 로 주면 잰다)")
+
+    print("\n④ 작업대 등록 — 다음 배치 실행에 들어간다")
+    print("  " + BN.add(game, "게임", "등록 명령으로 자동 등록"))
+    steps.append(("작업대등록", True))
+    _register_summary(game, steps)
+    return 0
+
+
+def _register_summary(game, steps):
+    print(f"\n{'='*54}")
+    print(f"[등록 결과] {game}")
+    for name, ok in steps:
+        print(f"  {'통과' if ok else '★막힘'}  {name}")
+    print("=" * 54)
+
+
+def cmd_compose(args):
+    """부품을 분해해 조합하고 **짧게 진짜로 굴려** 수치를 낸다 (08-14 신설).
+
+    사용:
+        scope.py 조합 목록                       # 코어에 뭐가 있나(분해)
+        scope.py 조합 부품                       # 켜고 끌 수 있는 것들
+        scope.py 조합 실행 [회차] [--부품 이름,이름]
+    """
+    from scopelib import compose as CP
+    sub = args[0] if args else "목록"
+
+    if sub in ("목록", "분해"):
+        rows = CP.inventory()
+        print(f"{'부품':14s} {'상태':10s} {'파라미터':>14s}  경로")
+        print("-" * 84)
+        tot = 0
+        for r in rows:
+            tot += r["파라미터"]
+            n = f"{r['파라미터']:,}" if r["파라미터"] else "-"
+            print(f"{r['부품']:14s} {r['상태']:10s} {n:>14s}  {r['경로']}")
+        print(f"\n합계 {tot:,} 파라미터 ({tot/1e6:.2f}M)")
+        with Run("조합분해", params={"env": "core", "episodes": 0,
+                                   "decision_rule": "inventory"}) as r:
+            r.metric("core.total_params", tot, unit="count")
+            r.table("부품", rows)
+        return
+
+    if sub == "부품":
+        print(f"{'부품':12s} {'환경변수':14s} 설명")
+        print("-" * 76)
+        for name, var, off, on, desc in CP.PARTS:
+            print(f"{name:12s} {var:14s} {desc}")
+        print(f"\n조합 수 = 2^{len(CP.PARTS)} = {2**len(CP.PARTS)}가지")
+        return
+
+    if sub in ("실행", "run"):
+        upd = int(args[1]) if len(args) > 1 and args[1].isdigit() else 60
+        mx = int(args[args.index("--판길이") + 1]) if "--판길이" in args else 1200
+        only = None
+        if "--부품" in args:
+            only = args[args.index("--부품") + 1].split(",")
+        cs = list(CP.combos(only=only))
+        print(f"[조합] {len(cs)}가지 · 각 {upd}회차 · 판 최대 {mx}수 — **짧게 진짜로 굴린다**")
+        print("★이 값은 **어느 조합부터 길게 돌릴지 정렬하는 용도**다.")
+        print("  판정은 정본 조건(1000판×시드3)으로 다시 한다 — 규약 §9-1 '시뮬 30%'\n")
+        rows = []
+        for i, c in enumerate(cs, 1):
+            tag = " ".join(f"{k}{'켬' if v else '끔'}" for k, v in c.items())
+            print(f"  [{i}/{len(cs)}] {tag} …", end=" ", flush=True)
+            r = CP.run_one(c, updates=upd, max_step=mx)
+            rows.append(r)
+            print(f"판{r['판']} 클리어{r['클리어']} 출구{r['출구까지최소']} "
+                  f"{r['초당수']}수/초 ({r['초']}초)", flush=True)
+        print()
+        keys = [p[0] for p in CP.PARTS]
+        hdr = keys + ["판", "클리어", "출구까지최소", "평균보상", "초당수"]
+        print(" | ".join(f"{h:>8s}" for h in hdr))
+        print("-" * (11 * len(hdr)))
+        for r in sorted(rows, key=lambda x: (-(x["클리어"] or 0),
+                                             x["출구까지최소"] if x["출구까지최소"] is not None else 9e9)):
+            print(" | ".join(f"{str(r.get(h, '-')):>8s}" for h in hdr))
+        with Run("조합실행", params={"env": "e1m1", "episodes": upd,
+                                   "decision_rule": "short_screen"}) as run:
+            run.metric("compose.combos", len(rows), unit="count")
+            run.metric("compose.updates_each", upd, unit="count")
+            best = min(rows, key=lambda x: x["출구까지최소"] if x["출구까지최소"] is not None else 9e9)
+            if best["출구까지최소"] is not None:
+                run.metric("compose.best_exit_dist", best["출구까지최소"], unit="cells")
+            run.table("조합결과", rows)
+        return
+
+    print(cmd_compose.__doc__)
+
+
 def cmd_status():
     rows = find(limit=15)
     if not rows:
@@ -261,6 +435,14 @@ def main(argv):
         if len(argv) < 2:
             return print("체크포인트를 적어라: 해부 checkpoints_kernel/reflex_core.pt")
         cmd_dissect(argv[1], argv[2] if len(argv) > 2 else None)
+    elif cmd in ("등록", "register"):
+        if len(argv) < 2:
+            return print("게임을 적어라: 등록 resource_defense")
+        sys.exit(cmd_register(argv[1], argv[2] if len(argv) > 2 else None))
+    elif cmd in ("벤치", "benchmark"):
+        cmd_bench_speed(argv[1:] )
+    elif cmd in ("조합", "compose"):
+        cmd_compose(argv[1:] if len(argv) > 1 else [])
     elif cmd in ("작업대", "bench"):
         cmd_bench(argv[1] if len(argv) > 1 else "목록", *argv[2:])
     elif cmd in ("비교", "compare"):

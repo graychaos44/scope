@@ -107,6 +107,35 @@ class Run:
                                "설명": note})
         return self
 
+    def table(self, name, rows, columns=None):
+        """★원자료 표를 기록에 같이 넣는다 (08-13, 사용자 지적).
+
+        > *"스코프에서 **모든 데이터를 다 뽑을 수 있게** 만들자고 했었는데."*
+
+        요약 지표만 남기면 나중에 다른 질문이 생겼을 때 **다시 돌려야** 한다.
+        판마다·회차마다의 원자료를 표로 같이 넣어두면 그 기록 하나로 다시 물어볼 수 있다.
+
+        rows = 딕셔너리 목록(권장) 또는 목록의 목록(+columns).
+        `runs/<run_id>/<name>.tsv` 로 저장하고 산출물로 등록한다.
+        """
+        d = os.path.join(RUNS, self.id)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{name}.tsv")
+        rows = list(rows or [])
+        if rows and isinstance(rows[0], dict):
+            cols = columns or list(rows[0].keys())
+            body = [[r.get(c, "") for c in cols] for r in rows]
+        else:
+            cols = columns or [f"c{i}" for i in range(len(rows[0]) if rows else 0)]
+            body = rows
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\t".join(str(c) for c in cols) + "\n")
+            for r in body:
+                f.write("\t".join("" if v is None else str(v) for v in r) + "\n")
+        self.artifact(path, note=f"원자료 표 {len(body)}줄 x {len(cols)}열")
+        self.tags[f"표.{name}"] = f"{len(body)}줄"
+        return path
+
     def tag(self, k, v):
         self.tags[k] = v
         return self

@@ -9,6 +9,8 @@
   NOWON     이겼는지 안 알려준다        승률이 조용히 0 이 된다
   NOWIN?    won 은 있는데 늘 False      어려운 것인지 못 재는 것인지 안 갈린다
   DEADCELL  관측 칸이 내내 안 변한다     학습이 그 칸을 못 쓴다
+  BLANKSCREEN 화면이 내내 한 색이다      (화면 게임 전용) 그림이 안 들어온다
+  NOMOTION  쌓은 프레임이 다 똑같다      (화면 게임 전용) 움직임이 관측에 안 담긴다
   RANGE     관측 값이 규격을 크게 넘는다  교사가 못 배우는 원인이었다(V645)
   EPLEN     판이 너무 짧다             첫 수부터 끝낼 수 있다는 뜻
   NOTERM    판이 안 끝난다             학습이 멈춘다
@@ -52,6 +54,46 @@ def analyze(rec):
         out.append(("NOTERM", f"{S['판수']}판 중 {S['미종료']}판이 최대 수를 다 쓰도록 안 끝났다",
                     S["미종료"]))
 
+    # ── 행동 쏠림(정책 붕괴) ─────────────────────────────
+    # ★08-03 에 둠 정책이 **제자리에서 회전만** 했다(80스텝 이동 0, 회전 23회). 그때는 손으로 셌다.
+    #   한 버튼이 대부분을 차지하면 정책이 무너진 것이다 — 무작위 정책에는 안 나온다.
+    acts = [s2["a"] for e in eps for s2 in e["steps"]]
+    if acts:
+        import collections as _c
+        cnt = _c.Counter(acts)
+        n = len(acts)
+        top_a, top_n = cnt.most_common(1)[0]
+        share = top_n / n
+        used = len(cnt)
+        # 골고루 쓰면 1/버튼수 근처. 0.8 넘게 한쪽이면 쏠린 것
+        if share > 0.8 and used > 1:
+            out.append(("ACTBIAS", f"버튼 {top_a} 하나가 전체의 {share*100:.0f}% — 정책이 무너진 형태다"
+                                   f"(쓴 버튼 {used}/{S['버튼수']})", share))
+        elif used == 1:
+            out.append(("ACTBIAS", f"버튼 {top_a} **하나만** 쓴다 — 완전히 굳었다", 1.0))
+
+    # ── 화면 게임은 칸 단위 검사를 안 한다 (08-13, 규약 §9-6) ───────
+    #   기록에 남은 것은 픽셀이 아니라 **화면 요약** 여섯 칸이다
+    #   [평균, 표준편차, 최소, 최대, 밝은칸비율, 프레임차이].
+    #   픽셀 하나를 '죽은 칸' 으로 세는 것은 뜻이 없으므로, 대신 화면이 살아 있는지만 본다.
+    if S.get("화면게임") and len(O):
+        if O.shape[1] >= 6:
+            # ★평균이 아니라 **비율**로 본다.
+            #   평균으로 재면 정상인 첫 수 몇 개가 섞여 희석돼 못 잡는다(08-13 교정에서 발각).
+            blank = float((O[:, 1] < 1e-4).mean())
+            still = float((O[:, 5] < 1e-5).mean())
+            if blank > 0.9:
+                out.append(("BLANKSCREEN", f"수의 {blank*100:.0f}% 에서 화면이 한 가지 색이다 "
+                                           f"— 그림이 안 들어오고 있다", blank))
+            if still > 0.9:
+                out.append(("NOMOTION", f"수의 {still*100:.0f}% 에서 쌓은 프레임이 서로 똑같다 "
+                                        f"— 움직임이 관측에 안 담긴다"
+                                        f"(프레임 쌓기가 고장났거나 게임이 안 진행된다)", still))
+            if float(O[:, 3].max()) > 1.5:
+                out.append(("RANGE", f"화면 값이 {float(O[:, 3].max()):.2f} — 0~1 로 정규화가 안 됐다",
+                            float(O[:, 3].max())))
+        return out
+
     # ── 죽은 칸 ─────────────────────────────────────────
     if len(O):
         sd = O.std(axis=0)
@@ -87,6 +129,12 @@ def metrics(rec):
         m["env.dead_cells"] = float(sum(1 for i in range(len(sd))
                                         if sd[i] < 1e-6 and i not in reserved))
         m["env.obs_absmax"] = float(np.abs(O).max())
+    acts = [s2["a"] for e in rec["episodes"] for s2 in e["steps"]]
+    if acts:
+        import collections as _c
+        cnt = _c.Counter(acts)
+        m["policy.top_action_share"] = float(cnt.most_common(1)[0][1] / len(acts))
+        m["policy.actions_used"] = float(len(cnt))
     scores = [e["score"] for e in rec["episodes"] if e.get("score") is not None]
     if scores:
         m["result.score_mean"] = float(np.mean(scores))
@@ -98,6 +146,7 @@ UNITS = {
     "env.timeout_count": "count", "result.winrate": "percent_0_100",
     "env.dead_cells": "count", "env.obs_absmax": "abs_value",
     "result.score_mean": "points",
+    "policy.top_action_share": "ratio_0_1", "policy.actions_used": "count",
     "baseline.random_winrate": "percent_0_100",
     "baseline.const_best": "percent_0_100",
     "baseline.blind_winrate": "percent_0_100",
